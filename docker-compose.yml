@@ -1,0 +1,22 @@
+services:
+  mongo:
+    image: mongo:5.0.2
+    restart: 'unless-stopped'
+    ports:
+      - '27017:27017'
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+    volumes:
+      - mongodb_ai_interviewer:/data/db
+
+  redis:
+    image: redis:latest
+    ports:
+      - 6380:6379
+    volumes:
+      - redis_ts_toolkit_ai_interviewer:/data
+
+volumes:
+  mongodb_ai_interviewer:
+  redis_ts_toolkit_ai_interviewer:

@@ -1,0 +1,228 @@
+name: CI/CD - Backend
+
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch / PR to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Stage 1a: Lint
+  # ─────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run ESLint
+        run: pnpm run lint
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage 1b: Test (Vitest)
+  # ─────────────────────────────────────────────────────────────────
+  test:
+    name: Test (Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests
+        run: pnpm run test
+
+      - name: Generate coverage report
+        run: pnpm run test:coverage
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: coverage/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage 1c: Code analysis (npm audit).
+  # ─────────────────────────────────────────────────────────────────
+  analyze:
+    name: Code Analysis (pnpm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies (high+)
+        # Non-blocking: surfaces advisories in the run log without breaking
+        # deploys on transient or unactionable findings.
+        run: pnpm audit --prod --audit-level=high
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage 2: Build (depends on lint + test + analyze passing)
+  # ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test, analyze]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (tsup)
+        run: pnpm run build
+
+      - name: Write production env from secret
+        run: |
+          # The .env.production file is NOT committed to this repo.
+          # Configure a GitHub Actions secret named ENV_PRODUCTION whose value
+          # is the full contents of your .env.production file.
+          printf '%s' "${{ secrets.ENV_PRODUCTION }}" > .env.production
+
+      - name: Package deployment artifact
+        run: |
+          echo "Packaging build artifacts for deployment..."
+          tar czf deploy.tar.gz \
+            dist \
+            ecosystem.config.js \
+            package.json \
+            pnpm-lock.yaml \
+            start-production.js \
+            deploy.sh \
+            Caddyfile \
+            .env.production
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-deploy-bundle
+          path: deploy.tar.gz
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────
+  # Stage 3: Deploy (push to main / master OR manual dispatch only)
+  # ─────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-deploy-bundle
+
+      - name: Copy bundle to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          source: "deploy.tar.gz"
+          target: "/var/www/conveyai-backend"
+
+      - name: Run remote deploy script
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            export PATH="$HOME/.local/share/pnpm:$HOME/.nvm/versions/node/$(node -v 2>/dev/null || echo v20)/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+            cd /var/www/conveyai-backend
+
+            echo "Extracting new build files..."
+            tar xzf deploy.tar.gz
+
+            echo "Running deploy script..."
+            chmod +x deploy.sh
+            ./deploy.sh
+
+            echo "Waiting for application to start..."
+            sleep 5
+
+            echo "Checking deployment status..."
+            if pm2 list | grep -q "conveyai-backend.*online"; then
+              echo "Deployment successful - Application is running"
+            else
+              echo "Deployment failed - Application is not running"
+              pm2 logs conveyai-backend --lines 20
+              exit 1
+            fi
+
+      - name: Report status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == 'success' ]; then
+            echo "Deployment completed successfully."
+          else
+            echo "Deployment failed."
+          fi

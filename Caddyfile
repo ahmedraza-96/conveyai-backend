@@ -1,0 +1,7 @@
+conveyai.live, www.conveyai.live {
+	reverse_proxy localhost:3000
+}
+
+:80 {
+	reverse_proxy localhost:3000
+}
